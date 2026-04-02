@@ -15,7 +15,7 @@
 #define SED
 
 #ifdef SED
-enum { COMMISSIONED, SESSION_ESTABLISHED, TEMP_ATTR_UPDATED, HUM_ATTR_UPDATED, PRESS_ATTR_UPDATED, CO2_ATTR_UPDATED };
+enum { COMMISSIONED, COMMISSION_FAIL, NETWORK_CONNECTED, SESSION_ESTABLISHED, TEMP_ATTR_UPDATED, HUM_ATTR_UPDATED, PRESS_ATTR_UPDATED, CO2_ATTR_UPDATED };
 #endif
 
 using namespace esp_matter;
@@ -33,7 +33,7 @@ const uint8_t LED_PIN = 22;
 const uint8_t LED_LEVEL = LOW;
 
 #ifdef SED
-EventGroupHandle_t flags = NULL;
+static EventGroupHandle_t matter_flags = NULL;
 #endif
 static volatile uint32_t buttonPressed = 0;
 static float co2 = 450; // 450 PPM
@@ -71,16 +71,16 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
       if (endpoint_id == ::endpoint_id) {
         if ((cluster_id == TemperatureMeasurement::Id) && (attribute_id == TemperatureMeasurement::Attributes::MeasuredValue::Id)) {
           log_i("+TEMP_ATTR_UPDATED");
-          xEventGroupSetBits(flags, 1 << TEMP_ATTR_UPDATED);
+          xEventGroupSetBits(matter_flags, 1 << TEMP_ATTR_UPDATED);
         } else if ((cluster_id == RelativeHumidityMeasurement::Id) && (attribute_id == RelativeHumidityMeasurement::Attributes::MeasuredValue::Id)) {
           log_i("+HUM_ATTR_UPDATED");
-          xEventGroupSetBits(flags, 1 << HUM_ATTR_UPDATED);
+          xEventGroupSetBits(matter_flags, 1 << HUM_ATTR_UPDATED);
         } else if ((cluster_id == PressureMeasurement::Id) && (attribute_id == PressureMeasurement::Attributes::MeasuredValue::Id)) {
           log_i("+PRESS_ATTR_UPDATED");
-          xEventGroupSetBits(flags, 1 << PRESS_ATTR_UPDATED);
+          xEventGroupSetBits(matter_flags, 1 << PRESS_ATTR_UPDATED);
         } else if ((cluster_id == CarbonDioxideConcentrationMeasurement::Id) && (attribute_id == CarbonDioxideConcentrationMeasurement::Attributes::MeasuredValue::Id)) {
           log_i("+CO2_ATTR_UPDATED");
-          xEventGroupSetBits(flags, 1 << CO2_ATTR_UPDATED);
+          xEventGroupSetBits(matter_flags, 1 << CO2_ATTR_UPDATED);
         }
       }
 #endif
@@ -124,11 +124,15 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg) {
       log_v("Commissioning complete");
 #ifdef SED
       log_v("+COMMISSIONED");
-      xEventGroupSetBits(flags, (1 << COMMISSIONED));
+      xEventGroupSetBits(matter_flags, (1 << COMMISSIONED));
 #endif
       break;
     case chip::DeviceLayer::DeviceEventType::kFailSafeTimerExpired:
       log_v("Commissioning failed, fail safe timer expired");
+#ifdef SED
+      log_i("+COMMISSION_FAIL");
+      xEventGroupSetBits(matter_flags, (1 << COMMISSION_FAIL));
+#endif
       break;
     case chip::DeviceLayer::DeviceEventType::kCommissioningSessionStarted:
       log_v("Commissioning session started");
@@ -178,6 +182,10 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg) {
       break;
     case chip::DeviceLayer::DeviceEventType::kInternetConnectivityChange:
       log_v("InternetConnectivityChange");
+#ifdef SED
+      log_i("+NETWORK_CONNECTED");
+      xEventGroupSetBits(matter_flags, (1 << NETWORK_CONNECTED));
+#endif
       break;
     case chip::DeviceLayer::DeviceEventType::kServiceConnectivityChange:
       log_v("ServiceConnectivityChange");
@@ -200,8 +208,10 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg) {
     case chip::DeviceLayer::DeviceEventType::kSecureSessionEstablished:
       log_v("SecureSessionEstablished");
 #ifdef SED
-      log_v("+SESSION_ESTABLISHED");
-      xEventGroupSetBits(flags, (1 << SESSION_ESTABLISHED));
+      if (xEventGroupGetBits(matter_flags) & (1 << NETWORK_CONNECTED)) {
+        log_i("+SESSION_ESTABLISHED");
+        xEventGroupSetBits(matter_flags, (1 << SESSION_ESTABLISHED));
+      }
 #endif
       break;
     default:
@@ -255,8 +265,9 @@ static void matter_decommission() {
 
 static uint16_t air_sensor_init() {
   air_quality_sensor::config_t air_quality_sensor_config;
+  endpoint_t *endpoint;
 
-  endpoint_t *endpoint = air_quality_sensor::create(node::get(), &air_quality_sensor_config, ENDPOINT_FLAG_NONE, NULL);
+  endpoint = air_quality_sensor::create(node::get(), &air_quality_sensor_config, ENDPOINT_FLAG_NONE, nullptr);
   if (endpoint) {
     return endpoint::get_id(endpoint);
   } else {
@@ -283,15 +294,16 @@ static bool temp_sensor_init(uint16_t endpoint_id, int16_t temp) {
 // Application cluster specification, 7.18.2.11. Temperature
 // represents a temperature on the Celsius scale with a resolution of 0.01°C.
 // temp = (temperature in °C) x 100
-static void temp_sensor_update(uint16_t endpoint_id, int16_t temp) {
+static bool temp_sensor_update(uint16_t endpoint_id, int16_t temp) {
   esp_matter_attr_val_t val = esp_matter_invalid(NULL);
   attribute_t *attribute = attribute::get(endpoint_id, TemperatureMeasurement::Id, TemperatureMeasurement::Attributes::MeasuredValue::Id);
 
   if (attribute) {
     attribute::get_val(attribute, &val);
     val.val.i16 = temp;
-    attribute::update(endpoint_id, TemperatureMeasurement::Id, TemperatureMeasurement::Attributes::MeasuredValue::Id, &val);
+    return attribute::update(endpoint_id, TemperatureMeasurement::Id, TemperatureMeasurement::Attributes::MeasuredValue::Id, &val) == ESP_OK;
   }
+  return false;
 }
 
 static bool hum_sensor_init(uint16_t endpoint_id, uint16_t hum) {
@@ -309,15 +321,16 @@ static bool hum_sensor_init(uint16_t endpoint_id, uint16_t hum) {
   return false;
 }
 
-static void hum_sensor_update(uint16_t endpoint_id, uint16_t hum) {
+static bool hum_sensor_update(uint16_t endpoint_id, uint16_t hum) {
   esp_matter_attr_val_t val = esp_matter_invalid(NULL);
   attribute_t *attribute = attribute::get(endpoint_id, RelativeHumidityMeasurement::Id, RelativeHumidityMeasurement::Attributes::MeasuredValue::Id);
 
   if (attribute) {
     attribute::get_val(attribute, &val);
     val.val.u16 = hum;
-    attribute::update(endpoint_id, RelativeHumidityMeasurement::Id, RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val);
+    return attribute::update(endpoint_id, RelativeHumidityMeasurement::Id, RelativeHumidityMeasurement::Attributes::MeasuredValue::Id, &val) == ESP_OK;
   }
+  return false;
 }
 
 static bool press_sensor_init(uint16_t endpoint_id, int16_t press) {
@@ -335,15 +348,16 @@ static bool press_sensor_init(uint16_t endpoint_id, int16_t press) {
   return false;
 }
 
-static void press_sensor_update(uint16_t endpoint_id, int16_t press) {
+static bool press_sensor_update(uint16_t endpoint_id, int16_t press) {
   esp_matter_attr_val_t val = esp_matter_invalid(NULL);
   attribute_t *attribute = attribute::get(endpoint_id, PressureMeasurement::Id, PressureMeasurement::Attributes::MeasuredValue::Id);
 
   if (attribute) {
     attribute::get_val(attribute, &val);
     val.val.i16 = press;
-    attribute::update(endpoint_id, PressureMeasurement::Id, PressureMeasurement::Attributes::MeasuredValue::Id, &val);
+    return attribute::update(endpoint_id, PressureMeasurement::Id, PressureMeasurement::Attributes::MeasuredValue::Id, &val) == ESP_OK;
   }
+  return false;
 }
 
 static bool co2_sensor_init(uint16_t endpoint_id, float co2) {
@@ -360,18 +374,21 @@ static bool co2_sensor_init(uint16_t endpoint_id, float co2) {
   return false;
 }
 
-static void co2_sensor_update(uint16_t endpoint_id, float co2) {
+static bool co2_sensor_update(uint16_t endpoint_id, float co2) {
   esp_matter_attr_val_t val = esp_matter_invalid(NULL);
   attribute_t *attribute = attribute::get(endpoint_id, CarbonDioxideConcentrationMeasurement::Id, CarbonDioxideConcentrationMeasurement::Attributes::MeasuredValue::Id);
 
   if (attribute) {
     attribute::get_val(attribute, &val);
     val.val.f = co2;
-    attribute::update(endpoint_id, CarbonDioxideConcentrationMeasurement::Id, CarbonDioxideConcentrationMeasurement::Attributes::MeasuredValue::Id, &val);
+    return attribute::update(endpoint_id, CarbonDioxideConcentrationMeasurement::Id, CarbonDioxideConcentrationMeasurement::Attributes::MeasuredValue::Id, &val) == ESP_OK;
   }
+  return false;
 }
 
-static void update_sensors(uint16_t endpoint_id) {
+static bool update_sensors(uint16_t endpoint_id) {
+  bool result;
+
   digitalWrite(LED_PIN, LED_LEVEL);
   if (random(100) < 50)
     temp -= random(100);
@@ -390,11 +407,19 @@ static void update_sensors(uint16_t endpoint_id) {
   else
     co2 += random(100) / 10.0;
   Serial.printf("Temperature %.2f C, humidity %.2f%%, pressure %d hPa, CO2 %.0f PPM\r\n", temp / 100.0, hum / 100.0, press, co2);
-  temp_sensor_update(endpoint_id, temp);
-  hum_sensor_update(endpoint_id, hum);
-  press_sensor_update(endpoint_id, press);
-  co2_sensor_update(endpoint_id, co2);
+#ifdef SED
+  xEventGroupClearBits(matter_flags, (1 << TEMP_ATTR_UPDATED) | (1 << HUM_ATTR_UPDATED) | (1 << PRESS_ATTR_UPDATED) | (1 << CO2_ATTR_UPDATED));
+#endif
+  result = temp_sensor_update(endpoint_id, temp);
+  result = hum_sensor_update(endpoint_id, hum) && result;
+  result = press_sensor_update(endpoint_id, press) && result;
+  result = co2_sensor_update(endpoint_id, co2) && result;
+#ifdef SED
+  result = ((xEventGroupWaitBits(matter_flags, (1 << TEMP_ATTR_UPDATED) | (1 << HUM_ATTR_UPDATED) | (1 << PRESS_ATTR_UPDATED) | (1 << CO2_ATTR_UPDATED), pdTRUE, pdTRUE, pdMS_TO_TICKS(1000)) &
+    ((1 << TEMP_ATTR_UPDATED) | (1 << HUM_ATTR_UPDATED) | (1 << PRESS_ATTR_UPDATED) | (1 << CO2_ATTR_UPDATED))) == ((1 << TEMP_ATTR_UPDATED) | (1 << HUM_ATTR_UPDATED) | (1 << PRESS_ATTR_UPDATED) | (1 << CO2_ATTR_UPDATED))) && result;
+#endif
   digitalWrite(LED_PIN, ! LED_LEVEL);
+  return result;
 }
 
 void setup() {
@@ -402,8 +427,8 @@ void setup() {
   Serial.begin(115200);
 
 #ifdef SED
-  flags = xEventGroupCreate();
-  assert(flags);
+  matter_flags = xEventGroupCreate();
+  assert(matter_flags);
 #endif
 
   pinMode(BTN_PIN, INPUT_PULLUP);
@@ -416,36 +441,21 @@ void setup() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PSWD);
-  Serial.printf("Connecting to \"%s\"", WIFI_SSID);
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    digitalWrite(LED_PIN, ! digitalRead(LED_PIN));
-    Serial.print('.');
-  }
-  digitalWrite(LED_PIN, ! LED_LEVEL);
-  Serial.println(" OK");
+  Serial.printf("Connecting to \"%s\"...\r\n", WIFI_SSID);
 #endif
 
   assert(matter_init());
 
   endpoint_id = air_sensor_init();
-  temp_sensor_init(endpoint_id, temp);
-  hum_sensor_init(endpoint_id, hum);
-  press_sensor_init(endpoint_id, press);
-  co2_sensor_init(endpoint_id, co2);
+  assert(endpoint_id != 0xFFFF);
+  assert(temp_sensor_init(endpoint_id, temp));
+  assert(hum_sensor_init(endpoint_id, hum));
+  assert(press_sensor_init(endpoint_id, press));
+  assert(co2_sensor_init(endpoint_id, co2));
 
   assert(matter_begin());
 
 #ifdef SED
-  if (buttonPressed) {
-    if (buttonPressed >= 2000) { // 2 sec. to decommission
-      Serial.println("Decommissioning Temperature Sensor Matter Accessory. It shall be commissioned again.");
-      matter_decommission();
-    }
-    buttonPressed = 0;
-  }
-
   // Check Matter Accessory Commissioning state, which may change during execution of loop()
   if (! matter_isDeviceCommissioned()) {
     Serial.println();
@@ -455,24 +465,26 @@ void setup() {
     Serial.printf("Manual pairing code: %s\r\n", "34970112332");
     Serial.printf("QR code URL: %s\r\n", "https://project-chip.github.io/connectedhomeip/qrcode.html?data=MT:Y.K9042C00KA0648G00");
 
-    uint32_t timeCount = 0;
-
-    // waits for Matter Temperature Sensor Commissioning.
-    while (! matter_isDeviceCommissioned()) {
-      delay(100);
+    while (! (xEventGroupWaitBits(matter_flags, (1 << COMMISSIONED), pdTRUE, pdTRUE, pdMS_TO_TICKS(100)) & (1 << COMMISSIONED))) {
       digitalWrite(LED_PIN, ! digitalRead(LED_PIN));
-      if ((timeCount++ % 50) == 0) { // 50*100ms = 5 sec
-        Serial.println("Matter Node not commissioned yet. Waiting for commissioning.");
-      }
     }
     digitalWrite(LED_PIN, ! LED_LEVEL);
-    if (xEventGroupWaitBits(flags, (1 << COMMISSIONED), pdFALSE, pdTRUE, pdMS_TO_TICKS(30000)))
-      Serial.println("Matter Node is commissioned and connected to the network. Ready for use.");
+    Serial.println("Matter Node is commissioned.");
   }
 
-  if (xEventGroupWaitBits(flags, (1 << SESSION_ESTABLISHED), pdFALSE, pdTRUE, pdMS_TO_TICKS(15000))) {
-    update_sensors(endpoint_id);
-    if (xEventGroupWaitBits(flags, (1 << TEMP_ATTR_UPDATED) | (1 << HUM_ATTR_UPDATED) | (1 << PRESS_ATTR_UPDATED) | (1 << CO2_ATTR_UPDATED), pdFALSE, pdTRUE, pdMS_TO_TICKS(5000))) {
+  if (! matter_isDeviceConnected()) {
+    Serial.print("Waiting for network");
+    while (! matter_isDeviceConnected()) {
+      digitalWrite(LED_PIN, ! digitalRead(LED_PIN));
+      Serial.print('.');
+      delay(250);
+    }
+    digitalWrite(LED_PIN, ! LED_LEVEL);
+    Serial.println(" OK");
+  }
+
+  if (xEventGroupWaitBits(matter_flags, (1 << SESSION_ESTABLISHED), pdTRUE, pdTRUE, pdMS_TO_TICKS(30000))) {
+    if (update_sensors(endpoint_id)) {
       Serial.println("Matter attributes updated");
       delay(esp_reset_reason() == ESP_RST_DEEPSLEEP ? 1000 : 2000);
     }
